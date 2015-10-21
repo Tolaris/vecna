@@ -1,0 +1,709 @@
+#!/usr/bin/env python
+"""Rsync the filesystem to an encrypted drive."""
+
+# This is free software: you can redistribute it and/or modify it under the 
+# terms of the GNU General Public License as published by the Free Software 
+# Foundation, version 2.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+# details.
+#
+# For a copy of the GNU General Public License, version 2, see:
+# http://www.gnu.org/licenses/gpl-2.0.html
+
+from __future__ import print_function
+import os
+import sys
+import re
+import signal
+import socket
+import subprocess
+import time
+
+__author__ = "tyler@tolaris.com"
+__version__ = "4.1.2"
+prog = os.path.basename(sys.argv[0])
+name = "vecna"
+
+# TODO:
+# If dbus unavailable (single user mode), use mount/umount instead of udisks
+# Fix unmount_disk() to either loop on mountpoints or not loop at all
+# Reconsider symlink versus copy excludes file
+# Makefile with dpkg build
+
+"""
+Dependencies:
+apt-get install cryptsetup mount rsync
+package dependency: python (>= 2.6), cryptsetup, udisks, rsync
+
+Commands (minimum unique substring match):
+open - open LUKS device
+mount - mount open device
+unmount - unmount
+close - close LUKS device
+backup/rsync - rsync, aborting if destination not prepared
+list-backups - list all backups on disk
+initialize/initialise - prepare destination DEVICE and add it to device list
+add - add DEVICE to device list
+delete/remove - remove DEVICE from device list
+
+Example invocations:
+vecna open backup list-backups close
+vecna o b l c   - same as above
+vecna           - default, same as above
+vecna o m       - open and mount only
+
+Test tools:
+dd if=/dev/zero of=/root/vecna.img bs=1M count=100
+losetup /dev/loop0 /root/vecna.img
+cryptsetup luksFormat /dev/loop0
+cryptsetup luksOpen /dev/loop0 loop
+mkfs.ext4 /dev/mapper/loop
+blkid /dev/loop0
+udisks
+"""
+
+# globals
+conf_dir = os.path.join("/etc/", name)
+excludes_default = os.path.join(conf_dir, name + "_excludes.conf")
+devices_default = os.path.join(conf_dir, name + "_devices.conf")
+log_dir = os.path.join("/var/log/", name)
+log_file = ""            # will be set later
+logger = None            # will be set later
+date_format = "%Y-%m-%d %H:%M:%S %Z"
+hostname = socket.gethostname()
+
+def die(msg=""):
+    """Exit with message"""
+    if msg:
+        print("Error: " + msg)
+    # only keep logs that complete (reach the rsync stage)
+    if log_file:
+        os.remove(log_file)
+    sys.exit(1)
+
+def signal_handler_SIGINT(signal, frame):
+    """Catch Ctrl-C and exit gracefully"""
+    print
+    sys.exit()
+
+class Tee(object):
+    """Duplicate stdout to a file."""
+    # http://stackoverflow.com/questions/616645/how-do-i-duplicate-sys-stdout-to-a-log-file-in-python
+    # http://kaelbot.blogspot.co.uk/2009/06/tee-functionality-with-python.html
+    def __init__(self, name, mode="w"):
+        self.file = open(name, mode)
+        self.stdout = sys.stdout
+        sys.stdout = self
+    def __del__(self):
+        sys.stdout = self.stdout
+        self.file.close()
+    def write(self, data):
+        self.file.write(data)
+        self.stdout.write(data)
+    def flush(self):
+        self.file.flush()
+        self.stdout.flush()
+    def close(self):
+        self.__del__()
+
+def create_log_file():
+    """Create empty logfile and containing directory, returning filename"""
+    import pwd, grp
+    uid, gid = pwd.getpwnam('root')[2], grp.getgrnam('adm')[2]
+    directory = os.path.join("/var/log", name)
+    date_format = "%Y%m%d_%H:%M:%S_%Z"
+    filename = os.path.join(directory, "{0}_{1}.log".format(name, time.strftime(date_format)))
+    if not os.path.exists(directory):
+        # create .vecna as root:adm, mode 0750
+        print("Creating log directory {0}".format(directory))
+        os.mkdir(directory, 0750)
+        os.chown(directory, uid, gid)
+    # create new timestamp as root:adm, mode 0640
+    open(filename, 'w').close()
+    os.chown(filename, uid, gid)
+    os.chmod(filename, 0640)
+    return(filename)
+
+def rotate_log_files():
+    """Delete old log files"""
+    directory = os.path.join("/var/log", name)
+    maxcount = 15
+    files = [x for x in os.listdir(directory) if x[-4:] == ".log"]
+    files = sorted(files)
+    count = len(files)
+    if count > maxcount:
+        deletecount = count - maxcount
+        print("Removing {0} old logs from {1}".format(deletecount, directory))
+        for f in files[0:deletecount]:
+            os.remove(os.path.join(directory, f))
+
+def is_block_device(device):
+    """Check if a device is a block device"""
+    import stat
+    try:
+        return(stat.S_ISBLK(os.stat(device).st_mode))
+    except OSError:
+        return(False)
+
+def is_luks_device(device):
+    """Check if a device is a LUKS device"""
+    p = subprocess.Popen(["cryptsetup", "isLuks", device])
+    if p.wait() == 0:
+        return(True)
+    else:
+        return(False)
+
+def get_device_of_uuid(uuid):
+    """Get device matching a UUID, or return False"""
+    if not uuid:
+        return(False)
+    p = subprocess.Popen(["blkid", "-U", uuid], stdout=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+    if p.wait() == 0:
+        return(stdout.rstrip())
+    else:
+        return(False)
+
+def get_uuid_of_device(device):
+    """Get UUID of a device, or return False"""
+    if not device:
+        return(False)
+    p = subprocess.Popen(["blkid", "-o", "udev", device], stdout=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+    p.wait()
+    for line in stdout.split('\n'):
+        try:
+            key, value = line.rstrip().split('=')
+        except ValueError:
+            die("No UUID found for device {0}. Perhaps you meant to initialize?".format(device))
+        if key == "ID_FS_UUID":
+            return(value)
+    else:
+        return(False)
+
+def get_rsync_excludes_of_uuid(uuid):
+    """Gets rsync exclude file for a UUID"""
+    uuid_conf = os.path.join(conf_dir, uuid + ".conf")
+    if os.path.isfile(uuid_conf):
+        return(uuid_conf)
+    else:
+        return(excludes_default)
+
+def get_mountpoints_of_device(device):
+    """Get list of all mountpoints of device"""
+    # Returns list of mountpoints known by udisks.
+    p = subprocess.Popen(["udisks", "--show-info", device], stdout=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+    p.wait()
+    for line in stdout.split('\n'):
+        if re.search("^\s*mount paths:\s*/", line):
+            return([x.strip() for x in line.split(':')[1].split(',')])
+    else:
+        return(False)
+
+def get_mountpoint_of_device(device):
+    """Get (first) mountpoint of device"""
+    mountpoints = get_mountpoints_of_device(device)
+    if mountpoints:
+        return(mountpoints[0])
+    else:
+        return(False)
+
+def get_backup_dest(mountpoint):
+    """Return backup destination directory"""
+    dest = os.path.join(mountpoint, hostname)
+    if os.path.exists(dest):
+        if not os.path.isdir(dest):
+            die("{0} exists but isn't a directory.")
+    else:
+        os.mkdir(dest)
+    return(dest)
+
+def get_uuid_list():
+    """Return list of all configured devices"""
+    files = []
+    # Example: 10842a7a-3059-4012-8580-0721e2bc2c7b.conf
+    for filename in os.listdir(conf_dir):
+        if re.match("[0-9a-fA-F-]{36}\.conf$", filename):
+            files.append(filename[0:36])
+    return(files)
+
+def list_backups(mountpoint):
+    """Print summary of backups and disk usage"""
+    stamps_dir = os.path.join(mountpoint, "." + name)
+    if not os.path.isdir(stamps_dir):
+        die("No mounted {0} filesystem found".format(name))
+    print("\nBackups on {0}:".format(mountpoint))
+    print("{0:<25} {1}".format("Hostname", "Backup date"))
+    for filename in sorted(os.listdir(stamps_dir)):
+        print("{0:<25} {1}".format(filename, time.strftime(date_format, time.localtime(os.stat(os.path.join(stamps_dir,filename)).st_mtime))))
+    print()
+    p = subprocess.Popen(["df", "-h", "-l", "-x", "tmpfs", "-x", "devtmpfs", "-x", "ecryptfs"], stdout=subprocess.PIPE)
+    while p.poll() == None:
+        buf=os.read(p.stdout.fileno(),5000)
+        if logger:
+            logger.write(buf)
+        else:
+            print(buf)
+    p.wait()
+    print()
+
+def print_device_list():
+    """Print all configured devices"""
+    print("Configured device UUIDs:")
+    for i in get_uuid_list():
+        print(i)
+
+def find_first_device():
+    """Find first available device in device list"""
+    for uuid in get_uuid_list():
+        device = get_device_of_uuid(uuid)
+        if device:
+            return(device)
+    else:
+        die("No configured device detected.")
+
+def get_luks_raw_device(open_device):
+    """Find the raw LUKS device for an already open LUKS device"""
+    p = subprocess.Popen(["udisks", "--show-info", open_device], stdout=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+    p.wait()
+    pattern = re.compile("^\s*by-id:\s*/.*dm-uuid-CRYPT-LUKS1-([0-9a-fA-F]{32})")
+    for line in stdout.split('\n'):
+        m = pattern.search(line)
+        if m:
+            return(get_device_of_uuid("{0}-{1}-{2}-{3}-{4}".format(m.group(1)[:8], m.group(1)[8:12], m.group(1)[12:16], m.group(1)[16:20], m.group(1)[20:])))
+    else:
+        return(False)
+
+def get_luks_open_device(raw_device):
+    """Find the already open LUKS device for a raw LUKS device"""
+    # There is no other way except to iterate through the mapped devices
+    raw_device_uuid = get_uuid_of_device(raw_device)
+    if not raw_device_uuid:
+        return(False)
+    devices = os.listdir("/dev/mapper/")
+    for device in devices:
+        device = os.path.join("/dev/mapper/", device)
+        if not is_block_device(device):
+            continue
+        if get_uuid_of_device(get_luks_raw_device(device)) == raw_device_uuid:
+            return(device)
+    else:
+        return(False)
+
+def get_first_passphrase(raw_device="/dev/null"):
+    """Get LUKS passphrase from user for a new luksFormat"""
+    import textwrap
+    import getpass
+    print("\nWARNING!\n========")
+    print("Initializing new {0} device on {1}. This will overwrite all data irrevocably. Press Ctrl-C to cancel.".format(name, raw_device))
+    print()
+    passphrase = getpass.getpass("Enter LUKS passphrase: ")
+    passphrase_check = getpass.getpass("Verify passphrase: ")
+    if passphrase != passphrase_check:
+        die("Passwords do not match, aborting")
+    else:
+        return(passphrase)
+
+def get_passphrase(device):
+    """Get LUKS passphrase from user"""
+    import getpass
+    passphrase = getpass.getpass("Enter LUKS passphrase for {0}: ".format(device))
+    return(passphrase)
+
+def format_luks(raw_device="/dev/null", passphrase=""):
+    """Format LUKS device and return returncode"""
+    print("Formatting {0} for LUKS encryption".format(raw_device))
+    if not passphrase:
+        die("format_luks() called without passphrase")
+    p = subprocess.Popen(["cryptsetup", "luksFormat", raw_device], stdin=subprocess.PIPE)
+    p.communicate(passphrase)
+    p.wait()
+    return(p.returncode)
+
+def format_fs(open_device, label, fs_type="ext4"):
+    """Format filesystem and return returncode"""
+    print("Creating {0} filesystem on {1}".format(fs_type, open_device))
+    p = subprocess.Popen(["mkfs." + fs_type, "-L", label, open_device])
+    if p.wait() == 0:
+        subprocess.Popen(["tune2fs", "-c", "30", "-m", "0", open_device]).wait()
+    return(p.returncode)
+
+def create_data_dir(mountpoint):
+    """Create .{0} directory in filesystem""".format(name)
+    import pwd, grp
+    if not mountpoint or not os.path.isdir(mountpoint):
+        die("{0} is not a directory or permission denied".format(mountpoint))
+    directory = os.path.join(mountpoint, "." + name)
+    if os.path.exists(directory):
+        print("{0} already exists, not creating it".format(directory))
+    else:
+        # create .vecna as root:adm, mode 0750
+        os.mkdir(directory, 0750)
+        os.chown(directory, pwd.getpwnam('root')[2], grp.getgrnam('adm')[2])
+
+def update_timestamp(dest):
+    """Update timestamp after backup"""
+    import pwd, grp
+    stamp_file = os.path.join(dest, "." + name, hostname)
+    if os.path.exists(stamp_file):
+        # update timestamp only (similar to touch)
+        os.utime(stamp_file, None)
+    else:
+        if not os.path.exists(os.path.join(dest, "." + name)):
+            create_data_dir(dest)
+        # create new timestamp as root:adm, mode 0640
+        open(stamp_file, 'w').close()
+        os.chown(stamp_file, pwd.getpwnam('root')[2], grp.getgrnam('adm')[2])
+        os.chmod(stamp_file, 0640)
+
+def initialize(raw_device, label):
+    """Prepare new device for use with {0}""".format(name)
+    passphrase = get_first_passphrase(raw_device)
+    format_luks(raw_device, passphrase)
+    open_device = open_luks(raw_device, passphrase)
+    format_fs(open_device, label)
+    create_data_dir(mount_disk_safe(open_device))
+    unmount_disk(open_device)
+    close_luks(open_device)
+    add_disk(raw_device)
+
+def add_disk(device):
+    """Add disk to device list"""
+    uuid = get_uuid_of_device(device)
+    if not uuid:
+        die("Unable to add {0} to device list.".format(device))
+    conf_file = os.path.join(conf_dir, uuid + ".conf")
+    if os.path.exists(conf_file):
+        print("Not adding {0}, {1} already exists".format(device, conf_file))
+    else:
+        print("Adding {0} as {1}".format(device, conf_file))
+        os.symlink(excludes_default, conf_file)
+
+def del_disk(device):
+    """Remove disk from device list"""
+    uuid = get_uuid_of_device(device)
+    if not uuid:
+        die("Unable to delete {0} from device list.".format(device))
+    conf_file = os.path.join(conf_dir, uuid + ".conf")
+    if os.path.exists(conf_file):
+        print("Removing device {0} entry {1}".format(device, conf_file))
+        os.remove(conf_file)
+    else:
+        print("Unable to remove {0}, {1} does not exist".format(device, conf_file))
+
+def open_luks_safe(raw_device):
+    """Open only if closed LUKS device"""
+    open_device = get_luks_open_device(raw_device)
+    if open_device:
+        print("Found {0} already opened at {1}".format(raw_device, open_device))
+        return(open_device)
+    elif is_luks_device(raw_device):
+        passphrase = get_passphrase(raw_device)
+        return(open_luks(raw_device, passphrase))
+    else:
+        return(False)
+
+# cryptsetup return codes (from man page):
+# 1 wrong parameters
+# 2 no permission (bad passphrase)
+# 3 out of memory
+# 4 wrong device specified
+# 5 device already exists or device is busy.
+
+def open_luks(raw_device, passphrase):
+    """Open LUKS device and return path to open device"""
+    open_name = os.path.basename(raw_device) + "_crypt"
+    open_device = os.path.join("/dev/mapper", open_name)
+    print("Opening LUKS device {0} as {1}".format(raw_device, open_name))
+    p = subprocess.Popen(["cryptsetup", "luksOpen", raw_device, open_name], stdin=subprocess.PIPE)
+    p.communicate(passphrase)
+    if p.wait() == 0:
+        return(open_device)
+    else:
+        die("Unable to open {0}".format(raw_device))
+
+def close_luks(open_device):
+    """Close LUKS device and return returncode"""
+    print("Closing LUKS device {0}".format(open_device))
+    p = subprocess.Popen(["cryptsetup", "luksClose", open_device])
+    return(p.wait())
+
+def fsck_disk(open_device):
+    """fsck filesystem"""
+    p = subprocess.Popen(["e2fsck", "-p", open_device])
+    p.wait()
+
+def mount_disk_safe(open_device):
+    """Mount filesystem only if not mounted, and return path to mountpoint"""
+    mountpoint = get_mountpoint_of_device(open_device)
+    if mountpoint:
+        print("Found {0} already mounted at {1}".format(open_device, mountpoint))
+        return(mountpoint)
+    else:
+        fsck_disk(open_device)
+        return(mount_disk(open_device))
+
+def mount_disk(open_device):
+    """Mount filesystem and return path to mountpoint"""
+    # udisks --mount /dev/mapper/loop0_crypt 
+    # Mounted /org/freedesktop/UDisks/devices/dm_2d1 at /media/vecna
+    print("Mounting filesystem {0}".format(open_device), end='')
+    p = subprocess.Popen(["udisks", "--mount", open_device, "--mount-options", "noatime"], stdout=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+    p.wait()
+    time.sleep(1)
+    mountpoint = get_mountpoint_of_device(open_device)
+    if mountpoint:
+        print(" at {0}".format(mountpoint))
+        return(mountpoint)
+    else:
+	print(" ... mount failed!")
+        return(False)
+
+# may need to replace 'udisks <dev>' with 'umount <dir>'
+def unmount_disk(open_device):
+    """Unmount filesystem referenced by device"""
+    if open_device:
+        # Unmount all instances of disk (in case remounted with mount --bind)
+        mountpoints = get_mountpoints_of_device(open_device)
+        if mountpoints:
+            for mountpoint in mountpoints:
+                print("Unmounting filesystem {0}".format(mountpoint))
+                p = subprocess.Popen(["udisks", "--unmount", open_device], stdout=subprocess.PIPE)
+                stdout, stderr = p.communicate()
+                p.wait()
+                print(stdout.rstrip())
+                if stdout[0:14] == "Unmount failed":
+                    return(False)
+                else:
+                    # cheap hack to let disks sync
+                    time.sleep(1)
+    else:
+        die("No mounted device found.")
+    return(True)
+
+def open_disk(raw_device):
+    """If LUKS, open device and mount, returning mountpoint and open device. If not LUKS, mount and return mountpoint and False."""
+    open_device = open_luks_safe(raw_device)
+    # is LUKS?
+    if open_device:
+        mountpoint = mount_disk_safe(open_device)
+    # is unencrypted
+    else:
+        mountpoint = mount_disk_safe(raw_device)
+    return(mountpoint, open_device)
+
+def close_disk(open_device, raw_device):
+    """Unmount disk and close LUKS device (if LUKS)"""
+    if open_device:
+        if unmount_disk(open_device):
+            return(close_luks(open_device))
+        else:
+            return(False)
+    else:
+        print("No open disk found.")
+        return(False)
+
+def print_hms(t1, t2):
+    s = t2 - t1
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    hms = ""
+    if h > 1:
+        hms = "{0} hours, ".format(h)
+    elif h == 1:
+        hms = "{0} hour, ".format(h)
+    if hms:
+        if m > 1:
+            hms += "{0} minutes, ".format(m)
+        elif m == 1:
+            hms += "{0} minute, ".format(m)
+    if s == 1:
+        hms += "{0} second".format(int(round(s)))
+    else:
+        hms += "{0} seconds".format(int(round(s)))
+    return(hms)
+
+def backup(dest, src="/", excludes_file=excludes_default, rsync_args=[]):
+    """Backup filesystem to destination directory with rsync"""
+    if not rsync_args:
+        rsync_args=[]
+
+    if not dest:
+        die("No destination found for backup.")
+
+    if not os.path.isdir(dest):
+        die("Cannot backup to directory {0}".format(dest))
+
+    rsync_args = rsync_args + ["-a", "-v", "--delete", "--delete-excluded", "--exclude-from", excludes_file]
+
+    start_time = time.localtime()
+    print("Beginning backup of {0}:{1} to {2} at {3}.\n".format(hostname, src, dest, time.strftime(date_format, start_time)))
+    # call rsync and wait for it to finish, sending output to logger
+    p = subprocess.Popen(["rsync"] + rsync_args + [src, dest], stdout=subprocess.PIPE)
+    while p.poll() == None:
+        buf=os.read(p.stdout.fileno(),5000)
+        logger.write(buf)
+    returncode = p.wait()
+    end_time = time.localtime()
+    if returncode != 0:
+        die("rsync exited with code {0}. Aborting remaining tasks at {1}.".format(returncode, time.strftime(date_format, end_time)))
+    print("\nBackup complete at {0}. Rsync duration {1}.".format(time.strftime(date_format, end_time), print_hms(time.mktime(start_time), time.mktime(end_time))))
+    # touch stamp file
+    update_timestamp(os.path.normpath(os.path.join(dest, "..")))
+
+def match_abbreviation(abbreviation, string):
+    if string.find(abbreviation) == 0:
+        return(True)
+    else:
+        return(False)
+
+if __name__ == "__main__":
+    # If not root, switch to root user. This must be done before option parsing.
+    if os.getuid() != 0:
+        os.execvp("sudo", ["sudo"] + sys.argv) 
+
+    # grab Ctrl-C
+    signal.signal(signal.SIGINT, signal_handler_SIGINT)
+
+    # optparse
+    from optparse import OptionParser
+    usage = "%prog [options] [command] [...]"
+    version = "%prog " + __version__ + ", by " + __author__
+    epilog = "Commands (see source for details): open close mount unmount backup list-backups fsck add delete initialize list-devices find-device"
+    parser = OptionParser(usage=usage, version=version, description=__doc__, epilog=epilog)
+    parser.add_option("-l", "--label", action="store", help="specify filesystem label (with initialize command)")
+    parser.add_option("-d", "--device", action="store", help="specify target block device")
+    parser.add_option("-s", "--src", action="store", default="/", help="specify source directory (default \"/\")")
+    parser.add_option("-n", "--dry-run", action="append_const", const="-n", dest="rsync_args", help="rsync dry-run (don't actually copy files)")
+    (options, args) = parser.parse_args()
+
+    # default operation if run without arguments
+    if not args:
+        args = ['open', 'mount', 'backup', 'list-backups', 'unmount', 'close']
+
+    # parse CLI commands
+    sequential_commands = []
+    exclusive_commands = []
+    for command in args:
+        if match_abbreviation(command, "open"):
+            sequential_commands.append("open")
+        elif match_abbreviation(command, "close"):
+            sequential_commands.append("close")
+        elif match_abbreviation(command, "mount"):
+            sequential_commands.append("mount")
+        elif match_abbreviation(command, "unmount") or match_abbreviation(command, "umount"):
+            sequential_commands.append("unmount")
+        elif match_abbreviation(command, "backup") or match_abbreviation(command, "rsync"):
+            sequential_commands.append("backup")
+        elif match_abbreviation(command, "list-backups"):
+            sequential_commands.append("list-backups")
+        elif match_abbreviation(command, "fsck"):
+            sequential_commands.append("fsck")
+        elif match_abbreviation(command, "add"):
+            exclusive_commands.append("add")
+        elif match_abbreviation(command, "delete") or match_abbreviation(command, "remove"):
+            exclusive_commands.append("delete")
+        elif match_abbreviation(command, "initialize") or match_abbreviation(command, "initialise"):
+            exclusive_commands.append("initialize")
+        elif match_abbreviation(command, "list-devices"):
+            exclusive_commands.append("list-devices")
+        elif match_abbreviation(command, "find-device"):
+            exclusive_commands.append("find-device")
+        else:
+            die("Unrecognized command: {0}".format(command))
+
+    # exit if incompatible commands
+    if len(exclusive_commands) > 1 or ( len(exclusive_commands) == 1 and len(sequential_commands) > 0 ):
+        die("{0} may not be run with any other command".format(exclusive_commands[0]))
+
+    # auxiliary/exclusive commands
+    elif len(exclusive_commands) == 1:
+
+        # command initialize
+        if exclusive_commands[0] == "initialize":
+            # get label
+            if options.label:
+                label = options.label
+            else:
+                label = name + str(len(get_uuid_list()) + 1)
+
+            if options.device and is_block_device(options.device):
+                initialize(options.device, label)
+            else:
+                die("You must specify a valid -d [DEVICE] option")
+
+        # command add
+        elif exclusive_commands[0] == "add":
+            if options.device and is_block_device(options.device):
+                add_disk(options.device)
+            else:
+                print("You must specify a valid -d [DEVICE] option")
+
+        # command delete
+        elif exclusive_commands[0] == "delete":
+            if options.device and is_block_device(options.device):
+                del_disk(options.device)
+            else:
+                die("You must specify a valid -d [DEVICE] option (consider rm /etc/{0}/[UUID].conf)".format(name))
+
+        elif exclusive_commands[0] == "list-devices":
+            print_device_list()
+        elif exclusive_commands[0] == "find-device":
+            device = find_first_device()
+            print("Found UUID {0} on {1}".format(get_uuid_of_device(device), device))
+        else:
+            print("Skipping unrecognized command {0}".format(exclusive_commands[0]))
+
+    # process main (sequential) jobs
+    else:
+        # get device
+        if options.device:
+            if is_block_device(options.device):
+                raw_device = options.device
+            else:
+                die("{0} is not a block device.".format(options.device))
+        else:
+            raw_device = find_first_device()
+
+        if "backup" in sequential_commands:
+            # prepare log
+            log_file = create_log_file()
+            logger = Tee(log_file)
+
+        # initialize device variables (overwritten by open/mount operations)
+        if raw_device:
+            open_device = get_luks_open_device(raw_device)
+        else:
+            open_device = False
+
+        if open_device:
+            mountpoint = get_mountpoint_of_device(open_device)
+        else:
+            mountpoint = False
+
+        for command in sequential_commands:
+            if command == "open":
+                open_device = open_luks_safe(raw_device)
+            elif command == "mount":
+                mountpoint = mount_disk_safe(open_device)
+            elif command == "unmount":
+                unmount_disk(open_device)
+            elif command == "backup":
+                backup(get_backup_dest(mountpoint), options.src, get_rsync_excludes_of_uuid(get_uuid_of_device(raw_device)), options.rsync_args)
+            elif command == "list-backups":
+                list_backups(mountpoint)
+            elif command == "close":
+                close_luks(open_device)
+            elif command == "fsck":
+                print("manual fsck not yet implemented")
+
+        if logger:
+            logger.close()
+            rotate_log_files()
+            print("See {0} for details.".format(log_file))
