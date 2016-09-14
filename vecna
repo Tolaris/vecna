@@ -23,7 +23,7 @@ import subprocess
 import time
 
 __author__ = "tyler@tolaris.com"
-__version__ = "4.1.4"
+__version__ = "4.1.5"
 prog = os.path.basename(sys.argv[0])
 name = "vecna"
 
@@ -487,11 +487,11 @@ def mount_disk_safe(open_device):
 def mount_disk(open_device):
     """Mount filesystem and return path to mountpoint"""
     # udisksctl mount -b /dev/mapper/loop0_crypt
-    # udisks --mount /dev/mapper/loop0_crypt 
+    # udisks --mount /dev/mapper/loop0_crypt
     # Mounted /org/freedesktop/UDisks/devices/dm_2d1 at /media/vecna.
     print("Mounting filesystem {0}".format(open_device), end='')
     udiskscmd = get_udisks_cmd()
-    regex = re.compile("^Mounted .* at (.*)\.?$")
+    regex = re.compile("^Mounted .* at (.*)")
     if udiskscmd == "udisksctl":
         cmd = [udiskscmd, "mount", "-b", open_device, "-o", "noatime"]
     elif udiskscmd == "udisks":
@@ -504,8 +504,9 @@ def mount_disk(open_device):
     for line in stdout.split('\n'):
         m = regex.search(line)
         if m:
-            print(" at {0}".format(m.group(1)))
-            return(m.group(1))
+            mountpoint = get_mountpoint_of_device(open_device)
+            print(" at {0}".format(mountpoint))
+            return(mountpoint)
     else:
         print(" ... mount failed!")
         return(False)
