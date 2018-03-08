@@ -23,7 +23,7 @@ import subprocess
 import time
 
 __author__ = "tyler@tolaris.com"
-__version__ = "4.1.5"
+__version__ = "4.1.6"
 prog = os.path.basename(sys.argv[0])
 name = "vecna"
 
@@ -76,7 +76,6 @@ log_file = ""            # will be set later
 logger = None            # will be set later
 date_format = "%Y-%m-%d %H:%M:%S %Z"
 hostname = socket.gethostname()
-udiskscmd = None         # will be set later
 
 def die(msg=""):
     """Exit with message"""
@@ -150,8 +149,6 @@ def get_udisks_cmd():
         "udisksctl" if found, else
         "udisks" if found
     """
-    if udiskscmd is not None:
-        return udiskscmd
     import distutils.spawn
     if distutils.spawn.find_executable("udisksctl"):
         return "udisksctl"
