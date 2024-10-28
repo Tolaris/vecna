@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 """Rsync the filesystem to an encrypted drive."""
 
 # This is free software: you can redistribute it and/or modify it under the
@@ -13,7 +13,7 @@
 # For a copy of the GNU General Public License, version 2, see:
 # http://www.gnu.org/licenses/gpl-2.0.html
 
-from __future__ import print_function
+
 import os
 import sys
 import re
@@ -23,7 +23,7 @@ import subprocess
 import time
 
 __author__ = "tyler@tolaris.com"
-__version__ = "4.1.6"
+__version__ = "4.3.0"
 prog = os.path.basename(sys.argv[0])
 name = "vecna"
 
@@ -91,7 +91,7 @@ def die(msg=""):
 
 def signal_handler_SIGINT(signal, frame):
     """Catch Ctrl-C and exit gracefully"""
-    print
+    print("\n")
     sys.exit()
 
 class Tee(object):
@@ -124,12 +124,12 @@ def create_log_file():
     if not os.path.exists(directory):
         # create .vecna as root:adm, mode 0750
         print("Creating log directory {0}".format(directory))
-        os.mkdir(directory, 0750)
+        os.mkdir(directory, 0o750)
         os.chown(directory, uid, gid)
     # create new timestamp as root:adm, mode 0640
     open(filename, 'w').close()
     os.chown(filename, uid, gid)
-    os.chmod(filename, 0640)
+    os.chmod(filename, 0o640)
     return(filename)
 
 def rotate_log_files():
@@ -152,10 +152,10 @@ def get_udisks_cmd():
         "udisksctl" if found, else
         "udisks" if found
     """
-    import distutils.spawn
-    if distutils.spawn.find_executable("udisksctl"):
+    import shutil
+    if shutil.which("udisksctl"):
         return "udisksctl"
-    elif distutils.spawn.find_executable("udisks"):
+    elif shutil.which("udisks"):
         return "udisks"
     else:
         raise OSError("udisksctl or udisks not found")
@@ -180,7 +180,7 @@ def get_device_of_uuid(uuid):
     """Get device matching a UUID, or return False"""
     if not uuid:
         return(False)
-    p = subprocess.Popen(["blkid", "-U", uuid], stdout=subprocess.PIPE)
+    p = subprocess.Popen(["blkid", "-U", uuid], stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
     stdout, stderr = p.communicate()
     if p.wait() == 0:
         return(stdout.rstrip())
@@ -191,7 +191,7 @@ def get_uuid_of_device(device):
     """Get UUID of a device, or return False"""
     if not device:
         return(False)
-    p = subprocess.Popen(["blkid", "-o", "udev", device], stdout=subprocess.PIPE)
+    p = subprocess.Popen(["blkid", "-o", "udev", device], stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
     stdout, stderr = p.communicate()
     p.wait()
     for line in stdout.split('\n'):
@@ -223,7 +223,7 @@ def get_mountpoints_of_device(device):
         regex = re.compile("^\s*mount paths:\s*/")
     else:
         raise exception("cannot determine udisk command")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
     stdout, stderr = p.communicate()
     p.wait()
     for line in stdout.split('\n'):
@@ -261,7 +261,10 @@ def get_uuid_list():
 
 def list_backups(mountpoint):
     """Print summary of backups and disk usage"""
-    stamps_dir = os.path.join(mountpoint, "." + name)
+    try:
+        stamps_dir = os.path.join(mountpoint, "." + name)
+    except TypeError:
+        die("No mounted {0} filesystem found".format(name))
     if not os.path.isdir(stamps_dir):
         die("No mounted {0} filesystem found".format(name))
     print("\nBackups on {0}:".format(mountpoint))
@@ -269,15 +272,10 @@ def list_backups(mountpoint):
     for filename in sorted(os.listdir(stamps_dir)):
         print("{0:<25} {1}".format(filename, time.strftime(date_format, time.localtime(os.stat(os.path.join(stamps_dir,filename)).st_mtime))))
     print()
-    p = subprocess.Popen(["df", "-h", "-l", "-x", "tmpfs", "-x", "devtmpfs", "-x", "ecryptfs", "-x", "efivarfs"], stdout=subprocess.PIPE)
-    while p.poll() == None:
-        buf=os.read(p.stdout.fileno(),5000)
-        if logger:
-            logger.write(buf)
-        else:
-            print(buf)
+    p = subprocess.Popen(["df", "-h", "-l", "-x", "tmpfs", "-x", "devtmpfs", "-x", "ecryptfs", "-x", "efivarfs"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
+    stdout, stderr = p.communicate()
     p.wait()
-    print()
+    print(stdout.strip())
 
 def print_device_list():
     """Print all configured devices"""
@@ -305,7 +303,7 @@ def get_luks_raw_device(open_device):
         regex = re.compile("^\s*by-id:\s*/.*dm-uuid-CRYPT-LUKS[0-9]+-([0-9a-fA-F]{32})")
     else:
         raise Exception("Cannot determine udisk command")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
     stdout, stderr = p.communicate()
     p.wait()
     for line in stdout.split('\n'):
@@ -356,7 +354,7 @@ def format_luks(raw_device="/dev/null", passphrase=""):
     print("Formatting {0} for LUKS encryption".format(raw_device))
     if not passphrase:
         die("format_luks() called without passphrase")
-    p = subprocess.Popen(["cryptsetup", "luksFormat", raw_device], stdin=subprocess.PIPE)
+    p = subprocess.Popen(["cryptsetup", "luksFormat", raw_device], stdin=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
     p.communicate(passphrase)
     p.wait()
     return(p.returncode)
@@ -379,7 +377,7 @@ def create_data_dir(mountpoint):
         print("{0} already exists, not creating it".format(directory))
     else:
         # create .vecna as root:adm, mode 0750
-        os.mkdir(directory, 0750)
+        os.mkdir(directory, 0o750)
         os.chown(directory, pwd.getpwnam('root')[2], grp.getgrnam('adm')[2])
 
 def update_timestamp(dest):
@@ -395,7 +393,7 @@ def update_timestamp(dest):
         # create new timestamp as root:adm, mode 0640
         open(stamp_file, 'w').close()
         os.chown(stamp_file, pwd.getpwnam('root')[2], grp.getgrnam('adm')[2])
-        os.chmod(stamp_file, 0640)
+        os.chmod(stamp_file, 0o640)
 
 def initialize(raw_device, label):
     """Prepare new device for use with {0}""".format(name)
@@ -456,7 +454,7 @@ def open_luks(raw_device, passphrase):
     open_name = os.path.basename(raw_device) + "_crypt"
     open_device = os.path.join("/dev/mapper", open_name)
     print("Opening LUKS device {0} as {1}".format(raw_device, open_name))
-    p = subprocess.Popen(["cryptsetup", "luksOpen", raw_device, open_name], stdin=subprocess.PIPE)
+    p = subprocess.Popen(["cryptsetup", "luksOpen", raw_device, open_name], stdin=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
     p.communicate(passphrase)
     if p.wait() == 0:
         return(open_device)
@@ -498,7 +496,7 @@ def mount_disk(open_device):
         cmd = [udiskscmd, "--mount", open_device, "--mount-options", "noatime"]
     else:
         raise Exception("Cannot determine udisk command")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
     stdout, stderr = p.communicate()
     p.wait()
     for line in stdout.split('\n'):
@@ -523,7 +521,7 @@ def unmount_disk(open_device):
         cmd = [udiskscmd, "--unmount", open_device]
     else:
         raise Exception("Cannot determine udisk command")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
     stdout, stderr = p.communicate()
     p.wait()
     print(stdout.rstrip())
@@ -592,10 +590,10 @@ def backup(dest, src="/", excludes_file=excludes_default, rsync_args=[]):
     start_time = time.localtime()
     print("Beginning backup of {0}:{1} to {2} at {3}.\n".format(hostname, src, dest, time.strftime(date_format, start_time)))
     # call rsync and wait for it to finish, sending output to logger
-    p = subprocess.Popen(["rsync"] + rsync_args + [src, dest], stdout=subprocess.PIPE)
+    p = subprocess.Popen(["rsync"] + rsync_args + [src, dest], stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, text=True)
     while p.poll() == None:
         buf=os.read(p.stdout.fileno(),5000)
-        logger.write(buf)
+        logger.write(buf.decode())
     returncode = p.wait()
     end_time = time.localtime()
     if returncode != 0:
