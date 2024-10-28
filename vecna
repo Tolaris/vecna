@@ -1,8 +1,8 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 """Rsync the filesystem to an encrypted drive."""
 
-# This is free software: you can redistribute it and/or modify it under the 
-# terms of the GNU General Public License as published by the Free Software 
+# This is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
 # Foundation, version 2.
 #
 # This program is distributed in the hope that it will be useful, but WITHOUT
@@ -57,8 +57,11 @@ vecna           - default, same as above
 vecna o m       - open and mount only
 
 Test tools:
-dd if=/dev/zero of=/root/vecna.img bs=1M count=100
+dd if=/dev/zero of=/root/vecna.img bs=1M count=1000
 losetup /dev/loop0 /root/vecna.img
+vecna initialize -d /dev/loop0
+
+or manually:
 cryptsetup luksFormat /dev/loop0
 cryptsetup luksOpen /dev/loop0 loop
 mkfs.ext4 /dev/mapper/loop
@@ -266,7 +269,7 @@ def list_backups(mountpoint):
     for filename in sorted(os.listdir(stamps_dir)):
         print("{0:<25} {1}".format(filename, time.strftime(date_format, time.localtime(os.stat(os.path.join(stamps_dir,filename)).st_mtime))))
     print()
-    p = subprocess.Popen(["df", "-h", "-l", "-x", "tmpfs", "-x", "devtmpfs", "-x", "ecryptfs"], stdout=subprocess.PIPE)
+    p = subprocess.Popen(["df", "-h", "-l", "-x", "tmpfs", "-x", "devtmpfs", "-x", "ecryptfs", "-x", "efivarfs"], stdout=subprocess.PIPE)
     while p.poll() == None:
         buf=os.read(p.stdout.fileno(),5000)
         if logger:
@@ -296,10 +299,10 @@ def get_luks_raw_device(open_device):
     udiskscmd = get_udisks_cmd()
     if udiskscmd == "udisksctl":
         cmd = [udiskscmd, "info", "-b", open_device]
-        regex = re.compile("/dev/disk/by-id/dm-uuid-CRYPT-LUKS1-([0-9a-fA-F]{32})")
+        regex = re.compile("/dev/disk/by-id/dm-uuid-CRYPT-LUKS[0-9]+-([0-9a-fA-F]{32})")
     elif udiskscmd == "udisks":
         cmd = [udiskscmd, "--show-info", open_device]
-        regex = re.compile("^\s*by-id:\s*/.*dm-uuid-CRYPT-LUKS1-([0-9a-fA-F]{32})")
+        regex = re.compile("^\s*by-id:\s*/.*dm-uuid-CRYPT-LUKS[0-9]+-([0-9a-fA-F]{32})")
     else:
         raise Exception("Cannot determine udisk command")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
@@ -320,11 +323,11 @@ def get_luks_open_device(raw_device):
         return(False)
     devices = os.listdir("/dev/mapper/")
     for device in devices:
-        device = os.path.join("/dev/mapper/", device)
-        if not is_block_device(device):
+        device_path = os.path.join("/dev/mapper/", device)
+        if not is_block_device(device_path):
             continue
-        if get_uuid_of_device(get_luks_raw_device(device)) == raw_device_uuid:
-            return(device)
+        if get_uuid_of_device(get_luks_raw_device(device_path)) == raw_device_uuid:
+            return(device_path)
     else:
         return(False)
 
@@ -610,7 +613,7 @@ def match_abbreviation(abbreviation, string):
 if __name__ == "__main__":
     # If not root, switch to root user. This must be done before option parsing.
     if os.getuid() != 0:
-        os.execvp("sudo", ["sudo"] + sys.argv) 
+        os.execvp("sudo", ["sudo"] + sys.argv)
 
     # grab Ctrl-C
     signal.signal(signal.SIGINT, signal_handler_SIGINT)
